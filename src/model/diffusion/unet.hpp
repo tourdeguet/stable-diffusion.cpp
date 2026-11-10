@@ -95,6 +95,33 @@ struct UNetConfig {
             }
         }
 
+        // [P61] SD1.5 usa DecisionBlock (pre-norm + proj_in conv 1x1), no Transformer2DModel.
+        // OJO: las dimensiones del safetensors estan al reves (torch), asi que un proj_in
+        // [OC, IC, 1, 1] queda como ne = {1, 1, OC, IC} con el trailing 1 desteñido por el
+        // padding de ne[] -> n_dims puede venir a 4 y ne[2] = OC. NO fiarse de n_dims:
+        // se cuentan los ejes ne[i] != 1.
+        if (version == VERSION_SD1 || version == VERSION_SD1_INPAINT || version == VERSION_SD1_PIX2PIX) {
+            int n_proj = 0, n_conv_proj = 0;
+            for (const auto& [name, tensor_storage] : tensor_storage_map) {
+                if (!ends_with(name, ".proj_in.weight")) {
+                    continue;
+                }
+                n_proj++;
+                int real_dims = 0;
+                for (int i = 0; i < SD_MAX_DIMS; i++) {
+                    real_dims += (tensor_storage.ne[i] != 1) ? 1 : 0;
+                }
+                if (real_dims >= 3) {
+                    n_conv_proj++;
+                }
+            }
+            LOG_VERBOSE("[P61] proj_in: %d encontrados, %d con >=3 ejes != 1", n_proj, n_conv_proj);
+            if (n_conv_proj > 0) {
+                config.use_linear_projection = false;
+                LOG_VERBOSE("unet: DecisionBlock detectado -> use_linear_projection = false");
+            }
+        }
+
         if (const TensorStorage* input = find_weight("input_blocks.0.0.weight")) {
             if (input->n_dims == 4) {
                 config.in_channels    = static_cast<int>(input->ne[2]);

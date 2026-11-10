@@ -515,12 +515,26 @@ protected:
     std::string prefix;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
-        this->prefix         = prefix;
-        enum ggml_type wtype = GGML_TYPE_F16;
-        params["weight"]     = ggml_new_tensor_4d(ctx, wtype, kernel_size.second, kernel_size.first, in_channels, out_channels);
+        this->prefix = prefix;
+        // [P61] Rama B (VRAM): el conversor exporta los pesos 4D de conv aplastados
+        // a layout GEMM 2D [ic*kh*kw, oc]; solo así la dimensión reducida es
+        // cuantizable (Q8_0 exige filas de 32 elementos contiguos).
+        enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F16);
+        const int64_t kw     = kernel_size.second;
+        const int64_t kh     = kernel_size.first;
+        const int64_t k      = in_channels * kh * kw;
+        if (ggml_is_quantized(wtype) && kw == kh && (kw == 1 || kw == 3) &&
+            k % ggml_blck_size(wtype) != 0) {
+            // no cuantizable para esta geometria: F16 como siempre
+            wtype = GGML_TYPE_F16;
+        }
+        if (ggml_is_quantized(wtype)) {
+            params["weight"] = ggml_new_tensor_2d(ctx, wtype, k, out_channels);
+        } else {
+            params["weight"] = ggml_new_tensor_4d(ctx, wtype, kw, kh, in_channels, out_channels);
+        }
         if (bias) {
-            enum ggml_type wtype = GGML_TYPE_F32;
-            params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_channels);
+            params["bias"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_channels);
         }
     }
 
@@ -568,6 +582,58 @@ public:
             forward_params.conv2d.circular_y = ctx->circular_y_enabled;
             forward_params.conv2d.scale      = scale;
             return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, b, prefix, forward_params);
+        }
+        if (ggml_is_quantized(w->type)) {
+            // [P61] Rama B (VRAM): peso cuantizado en layout GEMM 2D [ic*kh*kw, oc].
+            // Grafo equivalente a ggml_conv_2d pero con los operandos de mul_mat
+            // intercambiados (weight como src0) para activar la ruta MMQ cuantizada.
+            GGML_ASSERT(ggml_n_dims(w) == 2);
+            GGML_ASSERT(w->ne[0] == in_channels * kernel_size.first * kernel_size.second);
+            GGML_ASSERT(w->ne[1] == out_channels);
+            if (scale != 1.f) {
+                x = ggml_ext_scale(ctx->ggml_ctx, x, scale);
+            }
+            if (padding.first != 0 || padding.second != 0) {
+                GGML_ASSERT(!ctx->circular_x_enabled);
+                GGML_ASSERT(!ctx->circular_y_enabled);
+            }
+            ggml_tensor* wk = ggml_reshape_4d(ctx->ggml_ctx,
+                                              w,
+                                              kernel_size.second,
+                                              kernel_size.first,
+                                              in_channels,
+                                              out_channels);
+            ggml_tensor* patches = ggml_im2col(ctx->ggml_ctx,
+                                               wk,
+                                               x,
+                                               stride.second,
+                                               stride.first,
+                                               padding.second,
+                                               padding.first,
+                                               dilation.second,
+                                               dilation.first,
+                                               true,
+                                               GGML_TYPE_F32);
+            // Con peso como src0 el GEMM produce [OC, Nprod] (el estandar, con patches
+            // como src0, produce [Nprod, OC]); el reshape/permute parte OC primero.
+            ggml_tensor* result = ggml_mul_mat(
+                ctx->ggml_ctx,
+                w,
+                ggml_reshape_2d(ctx->ggml_ctx,
+                                patches,
+                                patches->ne[0],
+                                patches->ne[3] * patches->ne[2] * patches->ne[1]));
+            result = ggml_reshape_4d(
+                ctx->ggml_ctx, result, out_channels, patches->ne[1], patches->ne[2], patches->ne[3]);
+            result = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, result, 2, 0, 1, 3));
+            if (scale != 1.f) {
+                result = ggml_ext_scale(ctx->ggml_ctx, result, 1.f / scale);
+            }
+            if (bias) {
+                b      = ggml_reshape_4d(ctx->ggml_ctx, b, 1, 1, b->ne[0], 1);
+                result = ggml_add_inplace(ctx->ggml_ctx, result, b);
+            }
+            return result;
         }
         return ggml_ext_conv_2d(ctx->ggml_ctx,
                                 x,

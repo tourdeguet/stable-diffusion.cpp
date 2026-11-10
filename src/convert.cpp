@@ -26,6 +26,11 @@
 struct TensorExportInfo {
     TensorStorage storage;
     ggml_type type;
+    // [P61] Rama B: cuando storage se aplana a layout GEMM 2D, estos son los
+    // ne/n_dims originales (4D del fichero) para poder cargar el tensor.
+    bool flattened = false;
+    int n_dims_src = 0;
+    int64_t ne_src[4] = {1, 1, 1, 1};
 };
 
 struct TensorExportJob {
@@ -69,6 +74,31 @@ static bool collect_tensors_for_export(ModelLoader& model_loader,
         TensorExportInfo info;
         info.storage = tensor_storage;
         info.type    = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules);
+        // [P61] Rama B (VRAM): pesos 4D de conv con kw==kh en {1,3} se exportan
+        // aplastados a layout GEMM 2D [ic*kh*kw, oc] para poder cuantizarlos:
+        // Q8_0 exige filas de 32 elementos contiguos y ne[0]=3 no lo cumple.
+        if (ggml_is_quantized(info.type) && tensor_storage.n_dims == 4 &&
+            tensor_storage.ne[0] == tensor_storage.ne[1] &&
+            (tensor_storage.ne[0] == 1 || tensor_storage.ne[0] == 3) &&
+            (tensor_storage.ne[0] * tensor_storage.ne[1] * tensor_storage.ne[2]) %
+                ggml_blck_size(info.type) ==
+                0) {
+            LOG_INFO("[p61] conv weight '%s' flattened to GEMM layout [%lld, %lld] for %s",
+                     tensor_storage.name.c_str(),
+                     (long long int)(tensor_storage.ne[0] * tensor_storage.ne[1] * tensor_storage.ne[2]),
+                     (long long int)tensor_storage.ne[3],
+                     ggml_type_name(info.type));
+            info.storage.n_dims = 2;
+            info.storage.ne[0]  = tensor_storage.ne[0] * tensor_storage.ne[1] * tensor_storage.ne[2];
+            info.storage.ne[1]  = tensor_storage.ne[3];
+            info.storage.ne[2]  = 1;
+            info.storage.ne[3]  = 1;
+            info.flattened      = true;
+            info.n_dims_src     = tensor_storage.n_dims;
+            for (int k = 0; k < 4; k++) {
+                info.ne_src[k] = tensor_storage.ne[k];
+            }
+        }
         tensors.push_back(std::move(info));
     }
     LOG_INFO("collected %zu tensors for export", tensors.size());
@@ -132,11 +162,9 @@ static bool preallocate_output_file(const std::string& output_path, uint64_t fil
 }
 
 static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& job) {
-    size_t mem_size = 1 * 1024 * 1024;
+    size_t mem_size = 4 * 1024 * 1024;
     mem_size += ggml_tensor_overhead();
-    TensorStorage output_storage = job.info.storage;
-    output_storage.type          = job.info.type;
-    mem_size += static_cast<size_t>(output_storage.nbytes());
+    mem_size += static_cast<size_t>(job.info.storage.nbytes());
 
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
     if (ggml_ctx == nullptr) {
@@ -144,7 +172,26 @@ static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& j
         return false;
     }
 
-    ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, job.info.type, job.info.storage.n_dims, job.info.storage.ne);
+    // [P61] Cargar en el tipo ORIGEN y convertir a job.info.type. Antes se creaba el tensor
+    // ya en el tipo destino (Q8_0) y se le pasaba a load_tensor, que no convierte: los
+    // bytes F32 del fichero acababan copiados dentro de un bloque Q8_0 (contenido corrupto
+    // aunque la cabecera GGUF declarase Q8_0).
+    // [P61] Rama B: el tensor destino siempre se crea con la forma ORIGINAL del fichero
+    // (load_tensor valida shape contra current_tensor_storage); el orden de bytes crudo
+    // de una conv [oc][ic][kh][kw] ya es el layout GEMM [ic*kh*kw, oc] por verificacion
+    // del kernel de im2col (ops.cpp:7014), asi que la conversion usa la fila aplanada.
+    const int n_load_dims   = job.info.flattened ? job.info.n_dims_src : job.info.storage.n_dims;
+    int64_t ne_load[4]      = {1, 1, 1, 1};
+    for (int k = 0; k < n_load_dims; k++) {
+        ne_load[k] = job.info.flattened ? job.info.ne_src[k] : job.info.storage.ne[k];
+    }
+    TensorStorage src_storage = job.info.storage;
+    src_storage.n_dims        = n_load_dims;
+    for (int k = 0; k < 4; k++) {
+        src_storage.ne[k] = ne_load[k];
+    }
+
+    ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, job.info.storage.type, n_load_dims, ne_load);
     if (tensor == nullptr) {
         ggml_free(ggml_ctx);
         job.error = "ggml_new_tensor failed for tensor '" + job.info.storage.name + "'";
@@ -152,17 +199,25 @@ static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& j
     }
     ggml_set_name(tensor, job.info.storage.name.c_str());
 
-    const size_t tensor_nbytes = ggml_nbytes(tensor);
-    if (tensor_nbytes > 0 && !model_loader.load_tensor(job.info.storage, tensor)) {
+    const size_t src_nbytes = ggml_nbytes(tensor);
+    if (src_nbytes > 0 && !model_loader.load_tensor(src_storage, tensor)) {
         ggml_free(ggml_ctx);
         job.error = "failed to load tensor '" + job.info.storage.name + "'";
         return false;
     }
 
-    job.data.resize(tensor_nbytes);
-    if (tensor_nbytes > 0) {
-        memcpy(job.data.data(), tensor->data, tensor_nbytes);
-    }
+    std::vector<float> imatrix = get_imatrix_collector().get_values(convert_tensor_name(job.info.storage.name, model_loader.get_sd_version()));
+    const size_t dst_nbytes = export_tensor_nbytes(job.info);
+    job.data.resize(dst_nbytes);
+    int64_t n_per_row = job.info.storage.ne[0];
+    int64_t n_rows    = job.info.storage.nelements() / n_per_row;
+    convert_tensor(tensor->data,
+                   tensor->type,
+                   job.data.data(),
+                   job.info.type,
+                   (int)n_rows,
+                   (int)n_per_row,
+                   std::move(imatrix));
     ggml_free(ggml_ctx);
     return true;
 }
@@ -373,8 +428,32 @@ static bool export_loaded_model(ModelLoader& model_loader,
     bool output_is_safetensors = ends_with(output_path, ".safetensors");
     TensorTypeRules type_rules = parse_tensor_type_rules(tensor_type_rules);
 
+    // [P61] Aplicar el tipo pedido (--type / --tensor-type) al storage antes de recolectar,
+    // igual que hace la ruta de inferencia. Sin esto, las reglas de tipo nunca alcanzan
+    // a Conv2d::init_params y el fichero sale con las convs intactas en F32.
+    if (!output_is_safetensors && (type != GGML_TYPE_COUNT || tensor_type_rules != nullptr)) {
+        model_loader.set_exporting(true);
+        model_loader.set_wtype_override(type, tensor_type_rules != nullptr ? tensor_type_rules : "");
+    }
+
     std::vector<TensorExportInfo> tensors;
     bool success = collect_tensors_for_export(model_loader, type, type_rules, tensors);
+
+    {
+        std::map<std::string, int> stat;
+        for (const auto& ti : tensors) {
+            const std::string& nm = ti.storage.name;
+            std::string g = "otro";
+            if (nm.find(".proj_in.weight") != std::string::npos) g = "proj_in";
+            else if (nm.find(".proj_out.weight") != std::string::npos) g = "proj_out";
+            else if (nm.find("in_layers.2.weight") != std::string::npos) g = "conv3x3";
+            else if (nm.find("transformer_blocks") != std::string::npos && nm.find(".weight") != std::string::npos) g = "linear";
+            if (g != "otro") stat[g + " " + ggml_type_name(ti.type)]++;
+        }
+        LOG_INFO("[P61] export mix:");
+        for (const auto& kv : stat) LOG_INFO("[P61]   %s x%d", kv.first.c_str(), kv.second);
+    }
+
     std::string error;
     if (success) {
         std::unique_ptr<StreamingModelWriter> writer;
@@ -446,6 +525,7 @@ static bool load_model_into_memory(ModelLoader& model_loader,
                                    std::vector<ggml_tensor*>& all_tensors,
                                    ggml_type output_type,
                                    const TensorTypeRules& type_rules) {
+    LOG_INFO("load_model_into_memory enter");
     const String2TensorStorage& storage_map = model_loader.get_tensor_storage_map();
     if (storage_map.empty()) {
         LOG_ERROR("no tensors to load into memory for convert");
@@ -464,10 +544,15 @@ static bool load_model_into_memory(ModelLoader& model_loader,
         const bool quant_src        = ggml_is_quantized(storage.type);
         const bool quant_dst        = ggml_is_quantized(export_type);
         if (quant_src && quant_dst) {
-            load_type = GGML_TYPE_F16;
+            load_type = GGML_TYPE_F32;
         } else if (quant_src || quant_dst) {
             load_type = quant_src ? export_type : storage.type;
         } else if (storage.type == GGML_TYPE_F32 || export_type == GGML_TYPE_F32) {
+            load_type = GGML_TYPE_F32;
+        }
+        // [P61] Cuantizar requiere cargar en un tipo NO cuantizado y convertir despues; no se
+        // puede escribir a traves de un load_tensor en un destino ya Q8_0 (copiaria bytes F32).
+        if (ggml_is_quantized(load_type) && load_type != storage.type) {
             load_type = GGML_TYPE_F32;
         }
         ggml_tensor* tensor = ggml_new_tensor(ctx, load_type, storage.n_dims, storage.ne);
@@ -605,6 +690,9 @@ bool convert_with_components(const char* model_path,
     }
 
     if (has_active_loras(loras, lora_count)) {
+        // [P61] Solo LoRA exige materializar el modelo en RAM. En ese camino va el
+        // riesgo del aborto 0xC0000409 (load en F32 vs lo que espera
+        // ModelManager::prepare_params) - ver doc ENTREGA-senior-CONVERSION-Q8 §6.
         LOG_INFO("loading the full model into memory to apply LoRAs");
         return convert_model_in_memory(model_loader, output_path, output_type, tensor_type_rules, convert_name, n_threads,
                                        loras, lora_count);
@@ -614,7 +702,16 @@ bool convert_with_components(const char* model_path,
         model_loader.convert_tensors_name();
     }
 
-    return export_loaded_model(model_loader, output_path, output_type, tensor_type_rules, n_threads, false, nullptr);
+    // [P61] Streaming cuando no hay LoRA: load_tensor_for_export carga en el tipo
+    // origen y convierte con convert_tensor (datos ya en el tipo destino), asi que
+    // el fichero sale correcto sin materializar 4 GB en RAM. El modo en memoria
+    // aborta con override de tipo (0xC0000005/0xC0000409).
+    return export_loaded_model(model_loader,
+                               output_path,
+                               output_type,
+                               tensor_type_rules,
+                               n_threads,
+                               convert_name);
 }
 
 bool convert(const char* input_path,

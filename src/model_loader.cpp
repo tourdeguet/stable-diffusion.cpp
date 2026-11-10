@@ -168,6 +168,10 @@ ModelLoader::ModelLoader()
     : n_threads_(sd_get_num_physical_cores()) {
 }
 
+// [P61] dtor explícito para localizar el AV de ~ModelLoader (0xC0000005 al salir de
+// add_file_impl). Debe seguir destruyendo TODO igual que ' = default'.
+ModelLoader::~ModelLoader() = default;
+
 size_t ModelLoader::add_file_path(const std::string& file_path) {
     auto it = std::find(file_paths_.begin(), file_paths_.end(), file_path);
     if (it != file_paths_.end()) {
@@ -191,7 +195,11 @@ void ModelLoader::set_n_threads(int n_threads) {
 }
 
 bool ModelLoader::init_from_file(const std::string& file_path, const std::string& prefix) {
-    return add_file(file_path, prefix);
+    // [P61] Antes: add_file() - copia candidato=*this que en este build aborta (0xC0000005)
+    // antes de llegar a add_file_impl. add_file_impl ya hace rebuild_catalog(), asi que
+    // el camino directo deja el mismo estado en files_/tensor_storage_map sin copiar.
+    FileId added_id = 0;
+    return add_file_impl(file_path, prefix, &added_id, /*force=*/false, FileScope::Catalog);
 }
 
 bool ModelLoader::parse_file(const std::string& file_path, const std::string& prefix) {
@@ -870,11 +878,18 @@ void ModelLoader::set_wtype_override(ggml_type wtype, std::string tensor_type_ru
         if (!tensor_should_be_converted(tensor_storage, dst_type)) {
             continue;
         }
+        // [P61] Cuantizar requiere cargar en no-cuantizado y convertir despues (ver
+        // convert.cpp). Durante la EXPORTACION (sin grafo de inferencia) se marca siempre;
+        // durante la inferencia se respeta el tipo original para no forzar cargas Q8.
+        if (ggml_is_quantized(dst_type) && !ggml_is_quantized(tensor_storage.type) && !exporting_) {
+            continue;
+        }
         tensor_storage.expected_type = dst_type;
     }
     invalidate_file_data();
     ++revision_;
 }
+
 
 void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
     if (model_files_processed) {
@@ -1632,7 +1647,16 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
         return false;
     }
     if (type != GGML_TYPE_COUNT) {
-        if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
+        // [P61] Rama B: pesos 4D de conv con kw==kh en {1,3} se exportan aplastados a
+        // [ic*kw*kh, oc] (collect_tensors_for_export); la fila GEMM copia los bytes crudos
+        // del fichero [oc][ic][kw][kh], asi que la divisibilidad se evalua sobre esa fila.
+        const bool conv_sq_4d = tensor_storage.n_dims == 4 &&
+            tensor_storage.ne[0] == tensor_storage.ne[1] &&
+            (tensor_storage.ne[0] == 1 || tensor_storage.ne[0] == 3);
+        const int64_t row0 = conv_sq_4d
+            ? (tensor_storage.ne[0] * tensor_storage.ne[1] * tensor_storage.ne[2])
+            : tensor_storage.ne[0];
+        if (ggml_is_quantized(type) && row0 % ggml_blck_size(type) != 0) {
             // Pass, do not convert
         } else if (ends_with(name, ".bias")) {
             // Pass, do not convert
@@ -1669,7 +1693,6 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
     }
     return false;
 }
-
 int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend, ggml_type type) const {
     size_t alignment = 128;
     if (backend != nullptr) {

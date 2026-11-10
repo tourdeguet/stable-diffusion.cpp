@@ -23,6 +23,70 @@
 
 namespace fs = std::filesystem;
 
+// [P61] Capturar el crash de -M convert (0xC0000005) y escribir un minidump.
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+
+static LONG P61_MiniDumpHandler(EXCEPTION_POINTERS* info) {
+    if (info == nullptr || info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    {
+        // [P61] log crudo sin dbghelp: RIP + primeros qword del stack.
+        CONTEXT* c   = info->ContextRecord;
+        auto e       = info->ExceptionRecord;
+        fprintf(stderr, "[P61-CRASH] code=0x%08lX addr=0x%p RIP=0x%p RSP=0x%p RBP=0x%p\n",
+                (unsigned long)e->ExceptionCode, (void*)e->ExceptionAddress, (void*)c->Rip,
+                (void*)c->Rsp, (void*)c->Rbp);
+        if (e->ExceptionCode == 0xC0000005 && e->NumberParameters >= 2) {
+            fprintf(stderr, "[P61-CRASH] access=%s target=0x%p\n",
+                    e->ExceptionInformation[0] == 0 ? "READ" : (e->ExceptionInformation[0] == 1 ? "WRITE" : "EXEC"),
+                    (void*)e->ExceptionInformation[1]);
+        }
+        const unsigned long long* sp = (const unsigned long long*)c->Rsp;
+        for (int i = 0; i < 48; ++i) {
+            void* p = (void*)sp[i];
+            if (p != nullptr) {
+                HMODULE m = nullptr;
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                       (wchar_t*)p, &m) && m != nullptr) {
+                    fprintf(stderr, "[P61-RET%02d] 0x%p mod=0x%p (module+0x%llx)\n", i, p, (void*)m,
+                            (unsigned long long)((char*)p - (char*)m));
+                }
+            }
+        }
+        fflush(stderr);
+    }
+    HMODULE dbg = LoadLibraryA("dbghelp.dll");
+    if (dbg != nullptr) {
+        auto dump = (BOOL(WINAPI*)(HANDLE, HANDLE, HANDLE, MINIDUMP_TYPE,
+                                   PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
+                                   PMINIDUMP_CALLBACK_INFORMATION))GetProcAddress(dbg, "MiniDumpWriteDump");
+        if (dump != nullptr) {
+            MINIDUMP_EXCEPTION_INFORMATION mei;
+            mei.ThreadId          = GetCurrentThreadId();
+            mei.ExceptionPointers = info;
+            mei.ClientPointers    = TRUE;
+            HANDLE h              = CreateFileA("C:\\Users\\Admin\\AppData\\Local\\Temp\\opencode\\dumps\\sd-cli.dmp",
+                                              GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                fprintf(stderr, "[P61-T] writing minidump\n"); fflush(stderr);
+                BOOL ok = dump(GetCurrentProcess(), GetCurrentProcess(), h,
+                               MiniDumpNormal,
+                               &mei, nullptr, nullptr);
+                DWORD err = GetLastError();
+                CloseHandle(h);
+                fprintf(stderr, "[P61-T] minidump written ok=%d err=%lu\n", (int)ok, err); fflush(stderr);
+            } else {
+                fprintf(stderr, "[P61-T] CreateFile failed err=%lu\n", GetLastError()); fflush(stderr);
+            }
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 const char* previews_str[] = {
     "none",
     "proj",
@@ -634,6 +698,9 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
 }
 
 int main(int argc, const char* argv[]) {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(P61_MiniDumpHandler);
+#endif
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;

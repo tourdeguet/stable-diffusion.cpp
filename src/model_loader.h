@@ -68,6 +68,7 @@ private:
     bool names_converted_     = false;
     ggml_type wtype_override_ = GGML_TYPE_COUNT;
     std::string tensor_type_rules_;
+    bool exporting_ = false;
     std::vector<FileStamp> parsed_dependencies_;
     std::map<std::string, std::set<std::string>> parsed_tensor_names_;
 
@@ -100,6 +101,7 @@ protected:
 
 public:
     ModelLoader();
+    ~ModelLoader();
 
     bool add_file(const std::string& path, const std::string& prefix = "", FileId* id = nullptr, bool force = false, FileScope scope = FileScope::Catalog);
     bool del_file(FileId id);
@@ -129,6 +131,7 @@ public:
     const std::map<std::string, std::string>& get_metadata() const { return metadata_; }
     void set_n_threads(int n_threads);
     void set_wtype_override(ggml_type wtype, std::string tensor_type_rules = "");
+    void set_exporting(bool exporting) { exporting_ = exporting; }
     void process_model_files(bool enable_mmap = false, bool writable_mmap = true);
     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                               std::set<std::string> ignore_tensors = {},
@@ -158,7 +161,6 @@ public:
 
     bool tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) const;
     int64_t get_params_mem_size(ggml_backend_t backend, ggml_type type = GGML_TYPE_COUNT) const;
-    ~ModelLoader() = default;
 };
 
 #endif  // __MODEL_LOADER_H__
