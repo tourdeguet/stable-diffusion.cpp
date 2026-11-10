@@ -428,6 +428,19 @@ static bool export_loaded_model(ModelLoader& model_loader,
     bool output_is_safetensors = ends_with(output_path, ".safetensors");
     TensorTypeRules type_rules = parse_tensor_type_rules(tensor_type_rules);
 
+    // [P61] Guarda anti-truncamiento: safetensors no soporta tipos cuantizados. Si
+    // se pide q8_0/q6/q4 con salida .safetensors, rechazar ANTES de abrir el fichero
+    // (el writer trunca al abrir; un fallo a mitad de conversion destruye la
+    // salida si coincide con el fichero de origen). Solo F16/F32/BF16 son legales.
+    if (output_is_safetensors && type != GGML_TYPE_COUNT && type != GGML_TYPE_F16 &&
+        type != GGML_TYPE_F32 && type != GGML_TYPE_BF16) {
+        LOG_ERROR("--type %s requires GGUF output: safetensors cannot store it "
+                  "(output: '%s')",
+                  ggml_type_name(type),
+                  output_path);
+        return false;
+    }
+
     // [P61] Aplicar el tipo pedido (--type / --tensor-type) al storage antes de recolectar,
     // igual que hace la ruta de inferencia. Sin esto, las reglas de tipo nunca alcanzan
     // a Conv2d::init_params y el fichero sale con las convs intactas en F32.
