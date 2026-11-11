@@ -1,7 +1,7 @@
 # ESTADO DEL PROYECTO — Fork sd.cpp para Pascal (sm_61)
 
 **Fecha:** 2026-11-11 (noche)
-**Repo:** `D:\sd-cpp`, `master @ b3e6519`, árbol limpio (sin parches de diagnóstico: la instrumentación `[P61-DUMP]` se revirtió al cerrar el Bug 2)
+**Repo:** `D:\sd-cpp`, `master @ e3f9b60`, árbol limpio. **Publicado:** https://github.com/tourdeguet/stable-diffusion.cpp · tag `p61-sm61-v1` · submódulo en https://github.com/tourdeguet/ggml (rama `p61-conv2d-sm61`)
 **Ramas:** `master` (todo) · `sd1.5-rama-b` + tag `sd1.5-rama-b-validada` (en `52d1e1c`)
 **Ruta de docs:** `D:\llama-pascal61\wt-fix\pascal61\docs\`
 
@@ -231,3 +231,48 @@ Catálogo definitivo: **9,75 GiB** en total; cada modelo entra entero en la 1060
 - **Controles antes que hipótesis:** SD1.5 con el mismo runner y Pony con el mismo binario demostraron que el entorno estaba bien; sin esos dos controles el trabajo se habría ido por el camino del backend o de la cuantización.
 - **Un fix "no funciona" puede ser un fix en el sitio equivocado.** El primer parche serializó la función entera (170 s, sin mejora visible: parecía que el multihilo no servía). Al estrechar el mutex volvió el crash, y eso localizó al culpable real (`ModelLoader` + arena ggml compartida, no `convert_tensor`). Comparar tiempos sin entender *qué* se serializó casi lleva a descartar el arreglo correcto.
 - **La prueba de corrección de un conversor es byte-identidad contra la ruta lenta**, no "termina sin crash".
+
+---
+
+## 11. Publicación y entorno de pruebas (2026-11-11 noche)
+
+### 11.1 Estado publicado
+
+| Elemento | Valor |
+|---|---|
+| Repo | `https://github.com/tourdeguet/stable-diffusion.cpp` |
+| Tag | `p61-sm61-v1` → `e3f9b60` |
+| Submódulo `ggml` | `https://github.com/tourdeguet/ggml`, rama `p61-conv2d-sm61` (commit `a11648f`) |
+| Base | upstream `e239e4b` + 8 commits (59 commits por detrás de upstream, a propósito) |
+| Licencia | MIT (heredada) |
+
+**Tres bloqueantes que había que cerrar antes de publicar, y cómo se cerraron:**
+
+1. **Submódulo irresoluble.** El gitlink apuntaba a `a11648f`, un commit que no existe en `leejet/ggml`: `git clone --recursive` moría con *reference is not a tree*. Ahora `.gitmodules` apunta al fork propio con ese commit en una rama. **Verificado con un clon real desde GitHub.**
+2. **Sin copia remota.** Los commits solo existían en un disco.
+3. **Docs fuera del repo.** Ahora `PASCAL61.md` en la raíz + `docs/pascal61/` + `scripts/sd_gguf_checkzeros.py`.
+
+**Build limpio verificado desde el clon** (`D:\p61-clone-test`): `cmake` + `ninja` + `nvcc` completan `sd-cli` (434 targets) y `sd-server` (19 targets) sin errores. Trampa descubierta al hacerlo: `ggml` tiene a su vez el submódulo `src/ggml-cuda/vendors/cutlass`; con un clon de un solo nivel falla con *CUTLASS headers not found*. Hay que clonar `--recursive` en todos los niveles.
+
+### 11.2 Entorno de pruebas con interfaz
+
+`D:\SD-UI` es **Forge 1.10.1**, que tiene loader GGUF propio (`backend/operations_gguf.py`, soporta Q8_0 y Q6_K). **Aun así no puede cargar estos ficheros**, por dos motivos independientes:
+
+1. Las convs 3x3 van aplanadas a layout GEMM: `unet.down_blocks.0.resnets.0.conv1.weight` tiene forma `(2880, 320)`; Forge espera `[320, 320, 3, 3]`.
+2. Nomenclatura sd.cpp (`unet.*`, `vae.*`, `te.*`) frente al esquema A1111 (`model.diffusion_model.*`, `first_stage_model.*`).
+
+Y aunque se pudiera, sería contraproducente: Forge es PyTorch, descomprimiría el Q8 por operación en fp16, sin kernel P3 y sin el reparto de memoria de sd.cpp. En 6 GB no cabría.
+
+**Solución adoptada:** probar con el `sd-server` del fork, que sí entiende estos GGUF y además expone `/sdapi/v1/...` (compatible A1111), `/v1/images/generations` (OpenAI) y `/sdcpp/v1/...` (nativa), con frontend web embebido.
+
+Instalación creada:
+
+```
+D:\SD-UI\p61\bin\sd-server.exe   111 MB (commit e3f9b60, compilado desde el clon)
+D:\SD-UI\p61\bin\sd-cli.exe      110 MB
+D:\SD-UI\p61\p61-server.bat      lanzador (ASCII puro + CRLF; valida modelo y abre el navegador)
+```
+
+Verificado end-to-end: `/sdcpp/v1/capabilities` y `/sdapi/v1/sd-models` responden, `POST /sdapi/v1/txt2img` generó una esfera de cristal correcta en 21,8 s (512², 8 pasos), y `/` sirve el frontend (`stable-diffusion.cpp WebUI`).
+
+Uso: `D:\SD-UI\p61\p61-server.bat [ruta\modelo.gguf]` → http://127.0.0.1:1234
