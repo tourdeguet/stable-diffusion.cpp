@@ -1687,6 +1687,10 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
         } else if (ends_with(name, "_pad_token")) {
             // Pass, do not convert. LLaDA-Image stores its pad tokens far outside the f16
             // range, so any format with an f16 scale or payload turns them into inf.
+        } else if (starts_with(name, "vae.") || starts_with(name, "first_stage_model.")) {
+            // [P61] Pass, do not convert the VAE. Its decoder is numerically touchy and has
+            // always shipped f16/f32; quantising its 3x3 convs produced flat-grey decodes
+            // (NaN) and scale-like artifacts. Keep it out of the quantisation path.
         } else {
             return true;
         }

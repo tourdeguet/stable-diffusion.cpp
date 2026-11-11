@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -1699,13 +1700,17 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         }
     }
 
-    std::unordered_map<std::string, std::string> prefix_map = {
+    // [P61] vector ordenado de prefijo MAS LARGO a mas corto: con unordered_map el
+    // orden de iteracion es no determinista y `te.` podia ganar a `te.1.`, generando
+    // `cond_stage_model.transformer.1.text_model.*` (SDXL diffusers no cargaba).
+    std::vector<std::pair<std::string, std::string>> prefix_map = {
         {"diffusion_model.", "model.diffusion_model."},
         {"unet.", "model.diffusion_model."},
         {"transformer.", "model.diffusion_model."},  // dit
         {"vae.", "first_stage_model."},
         {"text_encoders.llm.text_embedding_projection.", "text_embedding_projection."},
         {"text_encoder.", "cond_stage_model.transformer."},
+        {"te.1.", "cond_stage_model.1.transformer."},  // [P61] SDXL diffusers (CLIP-G)
         {"te.", "cond_stage_model.transformer."},
         {"text_encoder.2.", "cond_stage_model.1.transformer."},
         {"conditioner.embedders.0.open_clip.", "cond_stage_model."},
@@ -1718,17 +1723,26 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         {"te3.", "text_encoders.t5xxl.transformer."},
         {"clip_vision.", "cond_stage_model.transformer."},
     };
+    std::sort(prefix_map.begin(), prefix_map.end(), [](const auto& a, const auto& b) {
+        return a.first.size() > b.first.size();
+    });
 
     if (sd_version_is_flux(version)) {
-        prefix_map["te1."] = "text_encoders.clip_l.transformer.";
+        for (auto& kv : prefix_map) {
+            if (kv.first == "te1.") {
+                kv.second = "text_encoders.clip_l.transformer.";
+            }
+        }
     }
 
-    if (sd_version_is_unet(version)) {
-        prefix_map["clip_l."] = "cond_stage_model.transformer.";
-        prefix_map["clip_g."] = "cond_stage_model.1.transformer.";
-    } else {
-        prefix_map["clip_l."] = "text_encoders.clip_l.transformer.";
-        prefix_map["clip_g."] = "text_encoders.clip_g.transformer.";
+    {
+        const char* clip_l_dst = sd_version_is_unet(version) ? "cond_stage_model.transformer." : "text_encoders.clip_l.transformer.";
+        const char* clip_g_dst = sd_version_is_unet(version) ? "cond_stage_model.1.transformer." : "text_encoders.clip_g.transformer.";
+        prefix_map.push_back({"clip_l.", clip_l_dst});
+        prefix_map.push_back({"clip_g.", clip_g_dst});
+        std::sort(prefix_map.begin(), prefix_map.end(), [](const auto& a, const auto& b) {
+            return a.first.size() > b.first.size();
+        });
     }
 
     replace_with_prefix_map(name, prefix_map);
