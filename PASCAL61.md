@@ -98,6 +98,38 @@ cmake --build build --target sd-cli -j
 inicializa el primer nivel, `cmake` falla con *CUTLASS headers not found at ...
 Run git submodule update --init --recursive*.
 
+## Servidor y API (`sd-server`)
+
+`sd-server` expone tres APIs sobre el mismo motor:
+
+| API | Ruta | Para qué |
+|---|---|---|
+| Stable Diffusion WebUI | `/sdapi/v1/...` | Cualquier cliente A1111/Forge-compatible |
+| OpenAI | `/v1/images/generations` | Clientes OpenAI |
+| Nativa | `/sdcpp/v1/...` | Jobs asíncronos, catálogo de modelos |
+
+Incluye un frontend web embebido (`examples/server/frontend`, se compila con `pnpm`).
+Es la forma recomendada de probar el fork con interfaz:
+
+```bat
+sd-server.exe -m modelo.gguf --model-dir <carpeta> --listen-port 1234
+REM luego abrir http://127.0.0.1:1234
+```
+
+Ejemplo de la misma generación por la API compatible con A1111:
+
+```bash
+curl -s http://127.0.0.1:1234/sdapi/v1/txt2img \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a crystal sphere on a table","steps":20,"width":512,"height":512,"seed":42}'
+```
+
+**Importante:** los GGUF de este fork **no** se pueden cargar en WebUI Forge ni en
+ComfyUI-GGUF. Las convoluciones 3x3 van aplanadas al layout GEMM
+`[ic*kh*kw, oc]` (es lo que permite el kernel P3) y las claves usan la
+nomenclatura de sd.cpp (`unet.*`, `vae.*`, `te.*`). Son formatos propios de
+sd.cpp: el motor es este binario, no PyTorch.
+
 ## Licencia
 
 MIT, la misma que upstream. Ver [`LICENSE`](LICENSE).
