@@ -1184,6 +1184,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         std::atomic<bool> failed(false);
         std::vector<std::thread> workers;
         std::mutex backend_tensor_set_mutex;
+        // [P61-IO] Diagnostico de tensores todo-cero (ver comentario en el bucle de trabajo)
+        size_t zero_tensor_count = 0;
+        std::vector<std::string> zero_tensor_names;
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
@@ -1342,6 +1345,25 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         failed = true;
                         break;
                     }
+                    // [P61-IO] Chequeo de ceros del fichero de ORIGEN (no del destino:
+                    // Q8_0 normaliza a cero -> -128 y F16 cero -> 0; en origen F16/F32/Q8
+                    // todo-cero son bytes 0x00). Si el origen ya trae un tensor a cero, el
+                    // problema es el fichero leido, no la conversion.
+                    if (nbytes_to_read >= 64) {
+                        bool src_all_zero = true;
+                        for (size_t k = 0; k < 64; k++) {
+                            if (read_buf[k] != 0) {
+                                src_all_zero = false;
+                                break;
+                            }
+                        }
+                        if (src_all_zero) {
+                            if (zero_tensor_names.size() < 16) {
+                                zero_tensor_names.push_back(tensor_storage.name);
+                            }
+                            zero_tensor_count++;
+                        }
+                    }
                     t1 = ggml_time_ms();
                     read_time_ms.fetch_add(t1 - t0);
 
@@ -1409,6 +1431,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                       bytes_processed.load(),
                                       elapsed_seconds);
             }
+            // [P61-IO] Sin progreso visible (p.ej. carga de 1 tensor para exportar) no
+            // tiene sentido dormir 10 ms por tensor: en una conversion son 2641 x 10ms
+            // = 26 s tirados. yield() deja el nucleo al worker y sale ya.
+            if (!log_progress) {
+                std::this_thread::yield();
+                continue;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
         }
 
@@ -1419,6 +1448,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         if (failed) {
             success = false;
             break;
+        }
+        if (zero_tensor_count > 0) {
+            LOG_WARN("[P61-IO] %zu tensor(es) con cabecera todo-cero en '%s' - el fichero puede estar truncado/corrupto. Ej: %s%s",
+                     zero_tensor_count,
+                     file_path.c_str(),
+                     zero_tensor_names.empty() ? "?" : zero_tensor_names[0].c_str(),
+                     zero_tensor_count > zero_tensor_names.size() ? " (y otros)" : "");
         }
         total_tensors_processed += tensors_to_process.size();
         if (log_progress && total_tensors_to_process > 0) {

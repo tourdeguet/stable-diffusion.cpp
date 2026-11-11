@@ -166,59 +166,84 @@ static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& j
     mem_size += ggml_tensor_overhead();
     mem_size += static_cast<size_t>(job.info.storage.nbytes());
 
-    ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
-    if (ggml_ctx == nullptr) {
-        job.error = "ggml_init failed for tensor '" + job.info.storage.name + "'";
-        return false;
-    }
+    // [P61-IO] Todo lo que toca ModelLoader (load_tensor reconstruye file_data, valida
+    // fuentes) y el arena de ggml por tensor se hace bajo este mutex. Los bytes crudos
+    // del origen se copian a un buffer propio y la CUANTIZACION (convert_tensor) se
+    // ejecuta fuera del lock, en paralelo entre hilos. Serializar la funcion entera
+    // daba 170s (igual que --threads 1); paralelizar sin lock daba 0xC0000409.
+    static std::mutex src_mutex;
+    std::vector<uint8_t> src_bytes;
+    ggml_type src_type   = job.info.storage.type;
+    std::vector<float> imatrix;
 
-    // [P61] Cargar en el tipo ORIGEN y convertir a job.info.type. Antes se creaba el tensor
-    // ya en el tipo destino (Q8_0) y se le pasaba a load_tensor, que no convierte: los
-    // bytes F32 del fichero acababan copiados dentro de un bloque Q8_0 (contenido corrupto
-    // aunque la cabecera GGUF declarase Q8_0).
-    // [P61] Rama B: el tensor destino siempre se crea con la forma ORIGINAL del fichero
-    // (load_tensor valida shape contra current_tensor_storage); el orden de bytes crudo
-    // de una conv [oc][ic][kh][kw] ya es el layout GEMM [ic*kh*kw, oc] por verificacion
-    // del kernel de im2col (ops.cpp:7014), asi que la conversion usa la fila aplanada.
-    const int n_load_dims   = job.info.flattened ? job.info.n_dims_src : job.info.storage.n_dims;
-    int64_t ne_load[4]      = {1, 1, 1, 1};
-    for (int k = 0; k < n_load_dims; k++) {
-        ne_load[k] = job.info.flattened ? job.info.ne_src[k] : job.info.storage.ne[k];
-    }
-    TensorStorage src_storage = job.info.storage;
-    src_storage.n_dims        = n_load_dims;
-    for (int k = 0; k < 4; k++) {
-        src_storage.ne[k] = ne_load[k];
-    }
+    {
+        std::lock_guard<std::mutex> src_lock(src_mutex);
 
-    ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, job.info.storage.type, n_load_dims, ne_load);
-    if (tensor == nullptr) {
+        ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
+        if (ggml_ctx == nullptr) {
+            job.error = "ggml_init failed for tensor '" + job.info.storage.name + "'";
+            return false;
+        }
+
+        // [P61] Cargar en el tipo ORIGEN y convertir a job.info.type. Antes se creaba el tensor
+        // ya en el tipo destino (Q8_0) y se le pasaba a load_tensor, que no convierte: los
+        // bytes F32 del fichero acababan copiados dentro de un bloque Q8_0 (contenido corrupto
+        // aunque la cabecera GGUF declarase Q8_0).
+        // [P61] Rama B: el tensor destino siempre se crea con la forma ORIGINAL del fichero
+        // (load_tensor valida shape contra current_tensor_storage); el orden de bytes crudo
+        // de una conv [oc][ic][kh][kw] ya es el layout GEMM [ic*kh*kw, oc] por verificacion
+        // del kernel de im2col (ops.cpp:7014), asi que la conversion usa la fila aplanada.
+        const int n_load_dims = job.info.flattened ? job.info.n_dims_src : job.info.storage.n_dims;
+        int64_t ne_load[4]    = {1, 1, 1, 1};
+        for (int k = 0; k < n_load_dims; k++) {
+            ne_load[k] = job.info.flattened ? job.info.ne_src[k] : job.info.storage.ne[k];
+        }
+        TensorStorage src_storage = job.info.storage;
+        src_storage.n_dims        = n_load_dims;
+        for (int k = 0; k < 4; k++) {
+            src_storage.ne[k] = ne_load[k];
+        }
+
+        ggml_tensor* tensor = ggml_new_tensor(ggml_ctx, job.info.storage.type, n_load_dims, ne_load);
+        if (tensor == nullptr) {
+            ggml_free(ggml_ctx);
+            job.error = "ggml_new_tensor failed for tensor '" + job.info.storage.name + "'";
+            return false;
+        }
+        ggml_set_name(tensor, job.info.storage.name.c_str());
+
+        const size_t src_nbytes = ggml_nbytes(tensor);
+        if (src_nbytes > 0) {
+            if (!model_loader.load_tensor(src_storage, tensor)) {
+                ggml_free(ggml_ctx);
+                job.error = "failed to load tensor '" + job.info.storage.name + "'";
+                return false;
+            }
+            src_bytes.assign(static_cast<const uint8_t*>(tensor->data),
+                             static_cast<const uint8_t*>(tensor->data) + src_nbytes);
+        }
         ggml_free(ggml_ctx);
-        job.error = "ggml_new_tensor failed for tensor '" + job.info.storage.name + "'";
-        return false;
-    }
-    ggml_set_name(tensor, job.info.storage.name.c_str());
 
-    const size_t src_nbytes = ggml_nbytes(tensor);
-    if (src_nbytes > 0 && !model_loader.load_tensor(src_storage, tensor)) {
-        ggml_free(ggml_ctx);
-        job.error = "failed to load tensor '" + job.info.storage.name + "'";
+        imatrix = get_imatrix_collector().get_values(
+            convert_tensor_name(job.info.storage.name, model_loader.get_sd_version()));
+    }
+
+    if (src_bytes.empty()) {
+        job.error = "empty source tensor '" + job.info.storage.name + "'";
         return false;
     }
 
-    std::vector<float> imatrix = get_imatrix_collector().get_values(convert_tensor_name(job.info.storage.name, model_loader.get_sd_version()));
     const size_t dst_nbytes = export_tensor_nbytes(job.info);
     job.data.resize(dst_nbytes);
     int64_t n_per_row = job.info.storage.ne[0];
     int64_t n_rows    = job.info.storage.nelements() / n_per_row;
-    convert_tensor(tensor->data,
-                   tensor->type,
+    convert_tensor(src_bytes.data(),
+                   src_type,
                    job.data.data(),
                    job.info.type,
                    (int)n_rows,
                    (int)n_per_row,
                    std::move(imatrix));
-    ggml_free(ggml_ctx);
     return true;
 }
 
@@ -270,9 +295,15 @@ static bool stream_tensor_data(ModelLoader& model_loader,
 
     std::mutex work_mutex;
     std::mutex progress_mutex;
+    // [P61-IO] Cada escritura abre su propio fichero (no se comparte el streambuf del CRT).
     std::condition_variable memory_cv;
     std::vector<std::thread> workers;
     workers.reserve(n_threads);
+
+    // [P61-IO] Marcas de escritura: (a) estado de progreso por tensor, (b) verificacion
+    // final de que TODOS los tensores se escribieron (un hueco de preasignacion es ceros).
+    std::vector<uint8_t> tensor_done(tensors.size(), 0);
+    size_t tensors_done_count = 0;
 
     auto reserve_memory = [&](size_t bytes) -> bool {
         std::unique_lock<std::mutex> lock(work_mutex);
@@ -307,12 +338,6 @@ static bool stream_tensor_data(ModelLoader& model_loader,
 
     for (int worker = 0; worker < n_threads; worker++) {
         workers.emplace_back([&]() {
-            std::fstream output_file(std::filesystem::u8path(output_path), std::ios::binary | std::ios::in | std::ios::out);
-            if (!output_file.is_open()) {
-                fail("failed to open output file '" + output_path + "' for tensor writing");
-                return;
-            }
-
             while (true) {
                 size_t tensor_index = 0;
                 {
@@ -346,15 +371,41 @@ static bool stream_tensor_data(ModelLoader& model_loader,
                     return;
                 }
 
+                // [P61-IO] Fichero propio por escritura: std::fstream compartido entre
+                // hilos corrompe el streambuf del CRT (0xC0000409) y, peor, si la escritura
+                // falla sin comprobarse, el hueco preasignado por preallocate_output_file
+                // queda a CERO y el GGUF termina con EXIT 0 (incidente jug-f16.gguf).
                 std::string write_error;
-                if (!writer.write_tensor(output_file,
-                                         tensor_index,
-                                         job.data.empty() ? nullptr : job.data.data(),
-                                         job.data.size(),
-                                         &write_error)) {
+                bool write_ok = false;
+                {
+                    std::fstream output_file(std::filesystem::u8path(output_path),
+                                             std::ios::binary | std::ios::in | std::ios::out);
+                    if (!output_file.is_open()) {
+                        write_error = "failed to open output file '" + output_path + "' for tensor writing";
+                    } else {
+                        write_ok = writer.write_tensor(output_file,
+                                                       tensor_index,
+                                                       job.data.empty() ? nullptr : job.data.data(),
+                                                       job.data.size(),
+                                                       &write_error);
+                        output_file.flush();
+                        if (write_ok && !output_file.good()) {
+                            write_ok     = false;
+                            write_error = "failed to flush tensor '" + job.info.storage.name +
+                                          "' (disco lleno?)";
+                        }
+                    }
+                }
+                if (!write_ok) {
                     release_memory(tensor_bytes);
                     fail(write_error.empty() ? "streaming conversion write failed" : write_error);
                     return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(work_mutex);
+                    tensor_done[tensor_index] = 1;
+                    tensors_done_count++;
                 }
 
                 {
@@ -382,6 +433,29 @@ static bool stream_tensor_data(ModelLoader& model_loader,
         }
         return false;
     }
+
+    // [P61-IO] Verificacion final: los N tensores se escribieron y el fichero tiene el
+    // tamano exacto. Sin esto, un hueco de preallocate_output_file (ceros) pasa por bueno.
+    if (tensors_done_count != tensors.size()) {
+        if (error != nullptr) {
+            *error = "streaming conversion incomplete: " + std::to_string(tensors_done_count) +
+                     " of " + std::to_string(tensors.size()) + " tensors written";
+        }
+        return false;
+    }
+    {
+        std::error_code ec;
+        const auto expected = static_cast<uintmax_t>(writer.file_size());
+        const auto actual   = std::filesystem::file_size(std::filesystem::u8path(output_path), ec);
+        if (ec || actual != expected) {
+            if (error != nullptr) {
+                *error = "output file size mismatch: expected " + std::to_string(expected) +
+                         " bytes, got " + (ec ? std::string("<stat failed>") : std::to_string(actual));
+            }
+            return false;
+        }
+    }
+
     LOG_INFO("streaming conversion completed, taking %.2fs", (ggml_time_ms() - start_time) / 1000.f);
     return true;
 }
