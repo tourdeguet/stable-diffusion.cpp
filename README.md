@@ -4,6 +4,12 @@
 
 # stable-diffusion.cpp
 
+> **Este repositorio es un fork para GPUs Pascal (sm_61, p. ej. GTX 1060 de 6 GB).**
+> Añade cuantización Q8_0 de las convoluciones 3x3 + un kernel implicit-GEMM
+> propio en `ggml`, y un conversor con verificación de integridad. Con eso SD1.5
+> pasa de 0,095 it/s (F16 con *thrashing*, 6 GB) a 1,35 it/s, y SDXL funciona
+> hasta 1024². Detalles, medidas y documentación: **[PASCAL61.md](PASCAL61.md)**.
+
 <div align="center">
 <a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
