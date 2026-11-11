@@ -83,10 +83,20 @@ declarado sin generar `.d`), así que **tras tocar un `.hpp` hay que limpiar los
 produce fallos imposibles de depurar.
 
 ```bat
+REM 1) clonar con TODOS los niveles de submodulos (ggml trae cutlass dentro)
+git clone --recursive https://github.com/tourdeguet/stable-diffusion.cpp.git
+cd stable-diffusion.cpp
+git submodule update --init --recursive --depth 1
+
+REM 2) compilar
 call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j
+cmake -B build -G Ninja -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target sd-cli -j
 ```
+
+`ggml` tiene a su vez el submódulo `src/ggml-cuda/vendors/cutlass`: si solo se
+inicializa el primer nivel, `cmake` falla con *CUTLASS headers not found at ...
+Run git submodule update --init --recursive*.
 
 ## Licencia
 
