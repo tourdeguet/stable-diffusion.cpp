@@ -276,3 +276,28 @@ D:\SD-UI\p61\p61-server.bat      lanzador (ASCII puro + CRLF; valida modelo y ab
 Verificado end-to-end: `/sdcpp/v1/capabilities` y `/sdapi/v1/sd-models` responden, `POST /sdapi/v1/txt2img` generó una esfera de cristal correcta en 21,8 s (512², 8 pasos), y `/` sirve el frontend (`stable-diffusion.cpp WebUI`).
 
 Uso: `D:\SD-UI\p61\p61-server.bat [ruta\modelo.gguf]` → http://127.0.0.1:1234
+
+### 11.3 Puente WebUI → sd.cpp (hecho, **en pausa**)
+
+Se escribió una extensión en `D:\SD-UI\extensions\sd-cpp-bridge\` que sustituye
+`modules.processing.process_images` (más `modules.img2img` y `modules.api.api`)
+por una llamada HTTP a `/sdapi/v1/txt2img` o `/sdapi/v1/img2img` del sd-server.
+Así la interfaz de Forge genera con el fork en vez de con PyTorch.
+
+**Verificado:** txt2img e img2img devuelven 200 con la imagen correcta
+ejecutando el fork (logs `[p61-bridge] iter 1/1: 1 imagen(es) en 17.4s`).
+
+**Por qué queda en pausa:**
+
+1. Forge inicializa su propio contexto CUDA aunque se arranque con `--use-cpu all`,
+   y deja al sd-server sin VRAM: aparece `model manager cannot make enough memory
+   available (need 5361.40 MB / available 4655.23 MB)` y el servidor responde
+   `generate_image returned no results`. La solución es lanzar Forge con
+   `set CUDA_VISIBLE_DEVICES=-1` (pendiente de probar).
+2. Funciona, pero es un escaparate: hires fix, ControlNet, ADetailer, upscalers y
+   LoRA siguen siendo PyTorch y no pasan por el fork.
+
+La extensión está **desactivada por defecto** (`P61_BRIDGE=1` para activarla), así
+que Forge se comporta como siempre si no se pide lo contrario. También se instaló
+`gguf` en su `venv`: sin él Forge ni arranca (`backend/utils.py` lo importa al
+inicio).
