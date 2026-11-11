@@ -1,6 +1,10 @@
 [submodule "ggml"]
     path = ggml
-	url = https://github.com/leejet/ggml.git
+	# [P61] Fork propio: la rama p61-conv2d-sm61 contiene el kernel implicit-GEMM
+	# conv2d para sm_61 (GTX 1060) que usa este fork. Apuntar a leejet/ggml haria el
+	# clone irresoluble (el commit del gitlink no existe ahi).
+	url = https://github.com/tourdeguet/ggml.git
+	branch = p61-conv2d-sm61
 [submodule "examples/server/frontend"]
 	path = examples/server/frontend
 	url = https://github.com/leejet/sdcpp-webui.git
